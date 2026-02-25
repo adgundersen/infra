@@ -22,6 +22,7 @@ type Customer struct {
 	Slug                 string
 	EC2InstanceID        string
 	EC2PublicIP          string
+	SSHPrivateKey        string
 	Status               Status
 	CreatedAt            time.Time
 }
@@ -44,11 +45,17 @@ func (s *Store) Migrate() error {
 			slug                   TEXT UNIQUE NOT NULL,
 			ec2_instance_id        TEXT NOT NULL DEFAULT '',
 			ec2_public_ip          TEXT NOT NULL DEFAULT '',
+			ssh_private_key        TEXT NOT NULL DEFAULT '',
 			status                 TEXT NOT NULL DEFAULT 'provisioning',
 			created_at             TIMESTAMPTZ NOT NULL DEFAULT NOW()
 		)
 	`)
-	return err
+	if err != nil {
+		return err
+	}
+	// Add ssh_private_key column if it doesn't exist (migration for existing tables)
+	_, _ = s.db.Exec(`ALTER TABLE customers ADD COLUMN IF NOT EXISTS ssh_private_key TEXT NOT NULL DEFAULT ''`)
+	return nil
 }
 
 func (s *Store) Create(c *Customer) error {
@@ -66,13 +73,13 @@ func (s *Store) GetByStripeID(stripeCustomerID string) (*Customer, error) {
 	c := &Customer{}
 	err := s.db.QueryRow(`
 		SELECT id, stripe_customer_id, stripe_subscription_id, email, slug,
-		       ec2_instance_id, ec2_public_ip, status, created_at
+		       ec2_instance_id, ec2_public_ip, ssh_private_key, status, created_at
 		FROM customers WHERE stripe_customer_id = $1`,
 		stripeCustomerID,
 	).Scan(
 		&c.ID, &c.StripeCustomerID, &c.StripeSubscriptionID,
 		&c.Email, &c.Slug, &c.EC2InstanceID, &c.EC2PublicIP,
-		&c.Status, &c.CreatedAt,
+		&c.SSHPrivateKey, &c.Status, &c.CreatedAt,
 	)
 	if err == sql.ErrNoRows {
 		return nil, nil
@@ -84,18 +91,23 @@ func (s *Store) GetBySlug(slug string) (*Customer, error) {
 	c := &Customer{}
 	err := s.db.QueryRow(`
 		SELECT id, stripe_customer_id, stripe_subscription_id, email, slug,
-		       ec2_instance_id, ec2_public_ip, status, created_at
+		       ec2_instance_id, ec2_public_ip, ssh_private_key, status, created_at
 		FROM customers WHERE slug = $1`,
 		slug,
 	).Scan(
 		&c.ID, &c.StripeCustomerID, &c.StripeSubscriptionID,
 		&c.Email, &c.Slug, &c.EC2InstanceID, &c.EC2PublicIP,
-		&c.Status, &c.CreatedAt,
+		&c.SSHPrivateKey, &c.Status, &c.CreatedAt,
 	)
 	if err == sql.ErrNoRows {
 		return nil, nil
 	}
 	return c, err
+}
+
+func (s *Store) UpdateSSHKey(id int64, privateKey string) error {
+	_, err := s.db.Exec(`UPDATE customers SET ssh_private_key = $1 WHERE id = $2`, privateKey, id)
+	return err
 }
 
 func (s *Store) UpdateEC2(id int64, instanceID, publicIP string) error {

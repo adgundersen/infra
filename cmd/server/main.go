@@ -38,11 +38,10 @@ func main() {
 	}
 
 	computeClient := compute.NewClient(awsCfg, compute.Config{
-		AMI:                mustEnv("EC2_AMI"),
-		InstanceType:       getEnv("EC2_INSTANCE_TYPE", "t3.micro"),
-		SecurityGroupID:    mustEnv("EC2_SECURITY_GROUP"),
-		SubnetID:           mustEnv("EC2_SUBNET"),
-		IAMInstanceProfile: mustEnv("EC2_IAM_PROFILE"),
+		AMI:             mustEnv("EC2_AMI"),
+		InstanceType:    getEnv("EC2_INSTANCE_TYPE", "t3.micro"),
+		SecurityGroupID: mustEnv("EC2_SECURITY_GROUP"),
+		SubnetID:        mustEnv("EC2_SUBNET"),
 	})
 
 	dnsClient := dns.NewClient(awsCfg, dns.Config{

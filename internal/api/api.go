@@ -38,6 +38,9 @@ func NewHandler(
 
 func (h *Handler) Routes() http.Handler {
 	r := chi.NewRouter()
+	r.Get("/health", func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	})
 	r.Post("/customers", h.createCustomer)
 	r.Get("/customers/{slug}", h.getCustomer)
 	r.Delete("/customers/{slug}", h.deleteCustomer)
@@ -119,16 +122,17 @@ func (h *Handler) provision(ctx context.Context, c *customer.Customer, password,
 		return
 	}
 	h.store.UpdateEC2(c.ID, instance.InstanceID, instance.PublicIP)
+	h.store.UpdateSSHKey(c.ID, instance.SSHPrivateKey)
 
 	// 2. Wait for instance to be ready
-	if err := h.compute.WaitUntilReady(ctx, instance.InstanceID); err != nil {
+	if err := h.compute.WaitUntilReady(ctx, instance.InstanceID, instance.PublicIP); err != nil {
 		fmt.Printf("provision: wait failed for %s: %v\n", c.Email, err)
 		h.store.UpdateStatus(c.ID, customer.StatusFailed)
 		return
 	}
 
-	// 3. Run provisioning script via SSM
-	if err := h.compute.Provision(ctx, instance.InstanceID, c.Slug, password, dbPassword); err != nil {
+	// 3. Run provisioning script via SSH
+	if err := h.compute.Provision(ctx, instance.PublicIP, instance.SSHPrivateKey, c.Slug, password, dbPassword); err != nil {
 		fmt.Printf("provision: script failed for %s: %v\n", c.Email, err)
 		h.store.UpdateStatus(c.ID, customer.StatusFailed)
 		return
