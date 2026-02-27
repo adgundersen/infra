@@ -1,65 +1,146 @@
 #!/bin/bash
-# provision.sh — v0.1 bootstrap: installs nginx and serves a welcome page
+# provision.sh — Crimata OS bootstrap
 # Usage: provision.sh <slug> <password> <db_password>
 
 set -euo pipefail
 
 SLUG=$1
+PASSWORD=$2
+DB_PASSWORD=$3
+OS_REPO="https://github.com/adgundersen/os"
 
 log() { echo "[crimata] $1"; }
 
-# ── 1. System dependencies ─────────────────────────────────────────────────────
-log "Installing nginx..."
+# ── 1. System dependencies ──────────────────────────────────────────────────
+log "Installing system dependencies..."
 apt-get update -qq
-apt-get install -y -qq nginx
+apt-get install -y -qq \
+    nginx \
+    postgresql postgresql-contrib \
+    gcc make \
+    libmicrohttpd-dev \
+    libpam-dev \
+    libsystemd-dev \
+    nodejs npm \
+    git
 
-# ── 2. Welcome page ────────────────────────────────────────────────────────────
-log "Creating welcome page..."
-mkdir -p /var/www/crimata
+# ── 2. Linux user (PAM auth uses real OS users) ─────────────────────────────
+log "Creating user $SLUG..."
+useradd --create-home --shell /bin/bash "$SLUG" || true
+echo "$SLUG:$PASSWORD" | chpasswd
 
-cat > /var/www/crimata/index.html << EOF
-<!DOCTYPE html>
-<html lang="en">
-<head>
-  <meta charset="UTF-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>Crimata — $SLUG</title>
-  <style>
-    * { margin: 0; padding: 0; box-sizing: border-box; }
-    body {
-      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
-      background: #0a0a0a;
-      color: #fff;
-      height: 100vh;
-      display: flex;
-      align-items: center;
-      justify-content: center;
-      flex-direction: column;
-      gap: 12px;
-    }
-    h1 { font-size: 2rem; font-weight: 600; }
-    p { color: #888; font-size: 1rem; }
-  </style>
-</head>
-<body>
-  <h1>Welcome, $SLUG.</h1>
-  <p>Your Crimata hub is ready.</p>
-</body>
-</html>
+# ── 3. Fetch OS source ──────────────────────────────────────────────────────
+log "Fetching OS..."
+git clone --depth 1 "$OS_REPO" /tmp/crimata-os
+
+# ── 4. Build and install core binaries ─────────────────────────────────────
+log "Building crimata-auth..."
+mkdir -p /opt/crimata/bin
+make -C /tmp/crimata-os/auth OUT=/opt/crimata/bin/crimata-auth
+
+log "Building crimata-dock..."
+make -C /tmp/crimata-os/dock OUT=/opt/crimata/bin/crimata-dock
+
+# ── 5. Install web desktop UI ───────────────────────────────────────────────
+log "Installing UI..."
+mkdir -p /opt/crimata/ui
+cp -r /tmp/crimata-os/ui/* /opt/crimata/ui/
+
+# ── 6. Install apps ─────────────────────────────────────────────────────────
+log "Installing crimata-contacts..."
+mkdir -p /usr/lib/crimata-contacts
+cp -r /tmp/crimata-os/apps/contacts/* /usr/lib/crimata-contacts/
+cd /usr/lib/crimata-contacts
+npm install --silent
+npm run build
+
+# ── 7. Postgres setup ───────────────────────────────────────────────────────
+log "Configuring Postgres..."
+systemctl enable postgresql
+systemctl start postgresql
+
+su -c "psql -tc \"SELECT 1 FROM pg_roles WHERE rolname='crimata'\" | grep -q 1 || \
+       psql -c \"CREATE USER crimata WITH PASSWORD '$DB_PASSWORD';\"" postgres
+
+su -c "psql -tc \"SELECT 1 FROM pg_database WHERE datname='crimata_contacts'\" | grep -q 1 || \
+       psql -c \"CREATE DATABASE crimata_contacts OWNER crimata;\"" postgres
+
+DATABASE_URL="postgresql://crimata:$DB_PASSWORD@localhost/crimata_contacts" \
+    node /usr/lib/crimata-contacts/dist/migrate.js
+
+# ── 8. systemd units ────────────────────────────────────────────────────────
+log "Installing systemd units..."
+
+cat > /etc/systemd/system/crimata-auth.service << EOF
+[Unit]
+Description=Crimata Auth
+After=network.target
+
+[Service]
+ExecStart=/opt/crimata/bin/crimata-auth
+Restart=always
+
+[Install]
+WantedBy=multi-user.target
 EOF
 
-# ── 3. Nginx config ────────────────────────────────────────────────────────────
+cat > /etc/systemd/system/crimata-dock.service << EOF
+[Unit]
+Description=Crimata Dock
+After=network.target
+
+[Service]
+ExecStart=/opt/crimata/bin/crimata-dock
+Restart=always
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+cat > /etc/systemd/system/crimata-contacts.service << EOF
+[Unit]
+Description=Crimata Contacts
+After=network.target postgresql.service
+
+[Service]
+ExecStart=node /usr/lib/crimata-contacts/dist/index.js
+Restart=always
+Environment=PORT=3001
+Environment=DATABASE_URL=postgresql://crimata:$DB_PASSWORD@localhost/crimata_contacts
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+systemctl daemon-reload
+systemctl enable crimata-auth crimata-dock crimata-contacts
+systemctl start crimata-auth crimata-dock crimata-contacts
+
+# ── 9. Nginx ────────────────────────────────────────────────────────────────
 log "Configuring nginx..."
+
 cat > /etc/nginx/sites-available/crimata << EOF
 server {
     listen 80;
     server_name $SLUG.crimata.com;
 
-    root /var/www/crimata;
+    root /opt/crimata/ui;
     index index.html;
 
     location / {
         try_files \$uri \$uri/ /index.html;
+    }
+
+    location /auth {
+        proxy_pass http://localhost:7700;
+    }
+
+    location /dock/ {
+        proxy_pass http://localhost:7701/;
+    }
+
+    location /apps/contacts/ {
+        proxy_pass http://localhost:3001/contacts/;
     }
 }
 EOF
@@ -70,4 +151,7 @@ nginx -t
 systemctl enable nginx
 systemctl restart nginx
 
-log "Provisioning complete. $SLUG.crimata.com is ready."
+# ── 10. Cleanup ─────────────────────────────────────────────────────────────
+rm -rf /tmp/crimata-os
+
+log "Done. $SLUG.crimata.com is live."

@@ -11,15 +11,15 @@ import (
 	"strings"
 
 	"github.com/adgundersen/crimata-infra/internal/compute"
-	"github.com/adgundersen/crimata-infra/internal/customer"
 	"github.com/adgundersen/crimata-infra/internal/dns"
 	"github.com/adgundersen/crimata-infra/internal/export"
+	"github.com/adgundersen/crimata-infra/internal/instance"
 	"github.com/adgundersen/crimata-infra/internal/notify"
 	"github.com/go-chi/chi/v5"
 )
 
 type Handler struct {
-	store   *customer.Store
+	store   *instance.Store
 	compute *compute.Client
 	dns     *dns.Client
 	notify  *notify.Client
@@ -27,7 +27,7 @@ type Handler struct {
 }
 
 func NewHandler(
-	store *customer.Store,
+	store *instance.Store,
 	compute *compute.Client,
 	dns *dns.Client,
 	notify *notify.Client,
@@ -41,9 +41,9 @@ func (h *Handler) Routes() http.Handler {
 	r.Get("/health", func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
 	})
-	r.Post("/customers", h.createCustomer)
-	r.Get("/customers/{slug}", h.getCustomer)
-	r.Delete("/customers/{slug}", h.deleteCustomer)
+	r.Post("/instances", h.createInstance)
+	r.Get("/instances/{slug}", h.getInstance)
+	r.Delete("/instances/{slug}", h.deleteInstance)
 	return r
 }
 
@@ -53,7 +53,7 @@ type createRequest struct {
 	Email                string `json:"email"`
 }
 
-func (h *Handler) createCustomer(w http.ResponseWriter, r *http.Request) {
+func (h *Handler) createInstance(w http.ResponseWriter, r *http.Request) {
 	var req createRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		http.Error(w, "invalid request", http.StatusBadRequest)
@@ -71,116 +71,113 @@ func (h *Handler) createCustomer(w http.ResponseWriter, r *http.Request) {
 	password   := randomHex(12)
 	dbPassword := randomHex(24)
 
-	c := &customer.Customer{
-		StripeCustomerID:     req.StripeCustomerID,
-		StripeSubscriptionID: req.StripeSubscriptionID,
-		Email:                req.Email,
-		Slug:                 slug,
-		Status:               customer.StatusProvisioning,
+	inst := &instance.Instance{
+		StripeCustomerID: req.StripeCustomerID,
+		Slug:             slug,
+		Status:           instance.StatusProvisioning,
 	}
-	if err := h.store.Create(c); err != nil {
-		http.Error(w, "failed to create customer record", http.StatusInternalServerError)
+	if err := h.store.Create(inst); err != nil {
+		http.Error(w, "failed to create instance record", http.StatusInternalServerError)
 		return
 	}
 
-	go h.provision(context.Background(), c, password, dbPassword)
+	go h.provision(context.Background(), inst, req.Email, password, dbPassword)
 
-	w.WriteHeader(http.StatusAccepted)
-	jsonResponse(w, c, http.StatusAccepted)
+	jsonResponse(w, inst, http.StatusAccepted)
 }
 
-func (h *Handler) getCustomer(w http.ResponseWriter, r *http.Request) {
+func (h *Handler) getInstance(w http.ResponseWriter, r *http.Request) {
 	slug := chi.URLParam(r, "slug")
-	c, err := h.store.GetBySlug(slug)
-	if err != nil || c == nil {
+	inst, err := h.store.GetBySlug(slug)
+	if err != nil || inst == nil {
 		http.Error(w, "not found", http.StatusNotFound)
 		return
 	}
-	jsonResponse(w, c, http.StatusOK)
+	jsonResponse(w, inst, http.StatusOK)
 }
 
-func (h *Handler) deleteCustomer(w http.ResponseWriter, r *http.Request) {
+func (h *Handler) deleteInstance(w http.ResponseWriter, r *http.Request) {
 	slug := chi.URLParam(r, "slug")
-	c, err := h.store.GetBySlug(slug)
-	if err != nil || c == nil {
+	inst, err := h.store.GetBySlug(slug)
+	if err != nil || inst == nil {
 		http.Error(w, "not found", http.StatusNotFound)
 		return
 	}
 
-	go h.deprovision(context.Background(), c)
+	go h.deprovision(context.Background(), inst)
 	w.WriteHeader(http.StatusAccepted)
 }
 
 // ── Provisioning ──────────────────────────────────────────────────────────────
 
-func (h *Handler) provision(ctx context.Context, c *customer.Customer, password, dbPassword string) {
+func (h *Handler) provision(ctx context.Context, inst *instance.Instance, email, password, dbPassword string) {
 	// 1. Launch EC2
-	instance, err := h.compute.Launch(ctx, c.Slug)
+	ec2, err := h.compute.Launch(ctx, inst.Slug)
 	if err != nil {
-		fmt.Printf("provision: launch failed for %s: %v\n", c.Email, err)
-		h.store.UpdateStatus(c.ID, customer.StatusFailed)
+		fmt.Printf("provision: launch failed for %s: %v\n", inst.Slug, err)
+		h.store.UpdateStatus(inst.ID, instance.StatusFailed)
 		return
 	}
-	h.store.UpdateEC2(c.ID, instance.InstanceID, instance.PublicIP)
-	h.store.UpdateSSHKey(c.ID, instance.SSHPrivateKey)
+	h.store.UpdateEC2(inst.ID, ec2.InstanceID, ec2.PublicIP)
+	h.store.UpdateSSHKey(inst.ID, ec2.SSHPrivateKey)
 
 	// 2. Wait for instance to be ready
-	if err := h.compute.WaitUntilReady(ctx, instance.InstanceID, instance.PublicIP); err != nil {
-		fmt.Printf("provision: wait failed for %s: %v\n", c.Email, err)
-		h.store.UpdateStatus(c.ID, customer.StatusFailed)
+	if err := h.compute.WaitUntilReady(ctx, ec2.InstanceID, ec2.PublicIP); err != nil {
+		fmt.Printf("provision: wait failed for %s: %v\n", inst.Slug, err)
+		h.store.UpdateStatus(inst.ID, instance.StatusFailed)
 		return
 	}
 
 	// 3. Run provisioning script via SSH
-	if err := h.compute.Provision(ctx, instance.PublicIP, instance.SSHPrivateKey, c.Slug, password, dbPassword); err != nil {
-		fmt.Printf("provision: script failed for %s: %v\n", c.Email, err)
-		h.store.UpdateStatus(c.ID, customer.StatusFailed)
+	if err := h.compute.Provision(ctx, ec2.PublicIP, ec2.SSHPrivateKey, inst.Slug, password, dbPassword); err != nil {
+		fmt.Printf("provision: script failed for %s: %v\n", inst.Slug, err)
+		h.store.UpdateStatus(inst.ID, instance.StatusFailed)
 		return
 	}
 
 	// 4. Create Route53 record
-	if err := h.dns.CreateRecord(ctx, c.Slug, instance.PublicIP); err != nil {
-		fmt.Printf("provision: dns failed for %s: %v\n", c.Email, err)
+	if err := h.dns.CreateRecord(ctx, inst.Slug, ec2.PublicIP); err != nil {
+		fmt.Printf("provision: dns failed for %s: %v\n", inst.Slug, err)
 	}
 
 	// 5. Send welcome email
-	if err := h.notify.SendWelcome(ctx, c.Email, c.Slug, password); err != nil {
-		fmt.Printf("provision: email failed for %s: %v\n", c.Email, err)
+	if err := h.notify.SendWelcome(ctx, email, inst.Slug, password); err != nil {
+		fmt.Printf("provision: email failed for %s: %v\n", inst.Slug, err)
 	}
 
-	h.store.UpdateStatus(c.ID, customer.StatusActive)
-	fmt.Printf("provision: %s is live at %s.crimata.com\n", c.Email, c.Slug)
+	h.store.UpdateStatus(inst.ID, instance.StatusActive)
+	fmt.Printf("provision: %s is live at %s.crimata.com\n", email, inst.Slug)
 }
 
-func (h *Handler) deprovision(ctx context.Context, c *customer.Customer) {
-	h.store.UpdateStatus(c.ID, customer.StatusCancelled)
+func (h *Handler) deprovision(ctx context.Context, inst *instance.Instance) {
+	h.store.UpdateStatus(inst.ID, instance.StatusCancelled)
 
 	// 1. Export data and email download link
-	downloadURL, err := h.export.Export(ctx, c.EC2InstanceID, c.Slug)
+	downloadURL, err := h.export.Export(ctx, inst.EC2InstanceID, inst.Slug)
 	if err != nil {
-		fmt.Printf("deprovision: export failed for %s: %v\n", c.Email, err)
+		fmt.Printf("deprovision: export failed for %s: %v\n", inst.Slug, err)
 	} else {
-		h.notify.SendDataExport(ctx, c.Email, downloadURL)
+		h.notify.SendDataExport(ctx, inst.StripeCustomerID, downloadURL)
 	}
 
 	// 2. Terminate EC2
-	if err := h.compute.Terminate(ctx, c.EC2InstanceID); err != nil {
-		fmt.Printf("deprovision: terminate failed for %s: %v\n", c.Email, err)
+	if err := h.compute.Terminate(ctx, inst.EC2InstanceID); err != nil {
+		fmt.Printf("deprovision: terminate failed for %s: %v\n", inst.Slug, err)
 	}
 
 	// 3. Remove Route53 record
-	if err := h.dns.DeleteRecord(ctx, c.Slug, c.EC2PublicIP); err != nil {
-		fmt.Printf("deprovision: dns delete failed for %s: %v\n", c.Email, err)
+	if err := h.dns.DeleteRecord(ctx, inst.Slug, inst.EC2PublicIP); err != nil {
+		fmt.Printf("deprovision: dns delete failed for %s: %v\n", inst.Slug, err)
 	}
 
-	fmt.Printf("deprovision: %s cleaned up\n", c.Email)
+	fmt.Printf("deprovision: %s cleaned up\n", inst.Slug)
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
 var slugRe = regexp.MustCompile(`[^a-z0-9]+`)
 
-func uniqueSlug(store *customer.Store, email string) string {
+func uniqueSlug(store *instance.Store, email string) string {
 	base := strings.Trim(slugRe.ReplaceAllString(
 		strings.ToLower(strings.Split(email, "@")[0]), "-"), "-")
 	if len(base) > 20 {

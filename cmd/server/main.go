@@ -10,9 +10,9 @@ import (
 
 	"github.com/adgundersen/crimata-infra/internal/api"
 	"github.com/adgundersen/crimata-infra/internal/compute"
-	"github.com/adgundersen/crimata-infra/internal/customer"
 	"github.com/adgundersen/crimata-infra/internal/dns"
 	"github.com/adgundersen/crimata-infra/internal/export"
+	"github.com/adgundersen/crimata-infra/internal/instance"
 	"github.com/adgundersen/crimata-infra/internal/notify"
 	awsconfig "github.com/aws/aws-sdk-go-v2/config"
 	_ "github.com/lib/pq"
@@ -25,7 +25,7 @@ func main() {
 	}
 	defer db.Close()
 
-	store := customer.NewStore(db)
+	store := instance.NewStore(db)
 	if err := store.Migrate(); err != nil {
 		log.Fatalf("migrate: %v", err)
 	}
