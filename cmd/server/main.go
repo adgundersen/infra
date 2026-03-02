@@ -49,8 +49,9 @@ func main() {
 		BaseDomain:   getEnv("BASE_DOMAIN", "crimata.com"),
 	})
 
-	notifyClient := notify.NewClient(awsCfg, notify.Config{
-		FromEmail:  getEnv("SES_FROM_EMAIL", "noreply@crimata.com"),
+	notifyClient := notify.NewClient(notify.Config{
+		ApiKey:     mustEnv("RESEND_API_KEY"),
+		FromEmail:  getEnv("MAILER_FROM", "hello@crimata.com"),
 		BaseDomain: getEnv("BASE_DOMAIN", "crimata.com"),
 	})
 
